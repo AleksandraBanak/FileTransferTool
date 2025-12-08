@@ -84,6 +84,27 @@ class Program
         {
             Console.WriteLine($"position = {entry.Key}, hash = {entry.Value}");
         }
+
+        Console.WriteLine();
+        Console.WriteLine("Final SHA256 checksums:");
+        string sourceShaHash = ComputeFileHash(sourcePath);
+        string destinationShaHash = ComputeFileHash(destinationPath);
+
+        Console.WriteLine($"Source SHA256:      {sourceShaHash}");
+        Console.WriteLine($"Destination SHA256: {destinationShaHash}");
+
+        Console.WriteLine(sourceShaHash == destinationShaHash ? "Files match" : "Files do not match");
+    }
+    static string ComputeFileHash(string path)
+    {
+        using SHA256 sha256 = SHA256.Create();
+        using FileStream stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read);
+
+        return ConvertToHex(sha256.ComputeHash(stream));
     }
     static string ConvertToHex(byte[] bytes)
     {
