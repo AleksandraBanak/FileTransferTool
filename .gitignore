@@ -1,0 +1,11 @@
+.vs/
+
+# Build output
+bin/
+obj/
+
+*.user
+*.suo
+
+Thumbs.db
+.DS_Store
