@@ -1,10 +1,12 @@
-﻿using System.Security.Cryptography;
+﻿using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using System.Text;
 
 class Program
 {
     private const int BlockSize = 1024 * 1024; // 1MB of data per block
     private const int MaxRetries = 3;
+    const int WorkerCount = 2;
     static void Main()
     {
         Console.Write("Source file path: ");
@@ -30,57 +32,41 @@ class Program
             Path.GetFileName(sourcePath)
         );
 
-        Dictionary<long, string> blockChecksums = new();
-
-        using (FileStream source = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read))
-        using (FileStream destination = new FileStream(destinationPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None))
+        long totalBytes = new FileInfo(sourcePath).Length;
+        long totalBlocks = (totalBytes + BlockSize - 1) / BlockSize;
+        using (var fs = new FileStream(destinationPath, FileMode.Create, FileAccess.Write))
         {
-            using MD5 md5 = MD5.Create();
-            byte[] buffer = new byte[BlockSize];
-            long offset = 0;
+            fs.SetLength(totalBytes);
+        }
 
-            int bytesRead;
-            while ((bytesRead = source.Read(buffer, 0, buffer.Length)) > 0)
-            {
-                byte[] blockData = new byte[bytesRead];
-                Array.Copy(buffer, blockData, bytesRead);
+        ConcurrentQueue<long> blockQueue = new ConcurrentQueue<long>();
+        for (long i = 0; i < totalBlocks; i++)
+            blockQueue.Enqueue(i);
 
-                string sourceHash = ConvertToHex(md5.ComputeHash(blockData));
-                bool verified = false;
+        ConcurrentDictionary<long, string> blockChecksums = new ConcurrentDictionary<long, string>();
+        ConcurrentBag<string> errors = new ConcurrentBag<string>();
 
-                for (int attempt = 1; attempt <= MaxRetries; attempt++)
-                {
-                    destination.Seek(offset, SeekOrigin.Begin);
-                    destination.Write(blockData, 0, bytesRead);
-                    destination.Flush();
+        Task[] workers = new Task[WorkerCount];
+        for (int i = 0; i < WorkerCount; i++)
+        {
+            workers[i] = Task.Run(() =>
+                RunWorker(sourcePath, destinationPath, totalBytes, blockQueue, blockChecksums, errors)
+            );
+        }
 
-                    destination.Seek(offset, SeekOrigin.Begin);
-                    byte[] verifyBuffer = new byte[bytesRead];
-                    destination.Read(verifyBuffer, 0, bytesRead);
+        Task.WaitAll(workers);
 
-                    string destHash = ConvertToHex(md5.ComputeHash(verifyBuffer));
-
-                    if (sourceHash == destHash)
-                    {
-                        blockChecksums[offset] = sourceHash;
-                        verified = true;
-                        break;
-                    }
-                }
-
-                if (!verified)
-                {
-                    Console.WriteLine($"Block at offset {offset} failed verification.");
-                    return;
-                }
-
-                offset += bytesRead;
-            }
+        if (!errors.IsEmpty)
+        {
+            Console.WriteLine("Transfer failed:");
+            foreach (var e in errors)
+                Console.WriteLine(e);
+            return;
         }
 
         Console.WriteLine();
         Console.WriteLine("Block checksums:");
-        foreach (var entry in blockChecksums)
+        foreach (var entry in blockChecksums.OrderBy(e => e.Key))
         {
             Console.WriteLine($"position = {entry.Key}, hash = {entry.Value}");
         }
@@ -94,6 +80,73 @@ class Program
         Console.WriteLine($"Destination SHA256: {destinationShaHash}");
 
         Console.WriteLine(sourceShaHash == destinationShaHash ? "Files match" : "Files do not match");
+
+        static void RunWorker(
+        string sourcePath,
+        string destinationPath,
+        long totalBytes,
+        ConcurrentQueue<long> blockQueue,
+        ConcurrentDictionary<long, string> blockChecksums,
+        ConcurrentBag<string> errors)
+        {
+            using FileStream source = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            using FileStream destination = new FileStream(destinationPath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+            using MD5 md5 = MD5.Create();
+
+            while (blockQueue.TryDequeue(out long blockIndex))
+            {
+                long offset = blockIndex * BlockSize;
+                int bytesToRead = (int)Math.Min(BlockSize, totalBytes - offset);
+
+                byte[] buffer = new byte[bytesToRead];
+
+                source.Seek(offset, SeekOrigin.Begin);
+                int totalRead = 0;
+
+                while (totalRead < bytesToRead)
+                {
+                    int read = source.Read(buffer, totalRead, bytesToRead - totalRead);
+
+                    if (read == 0)
+                    {
+                        errors.Add($"Unexpected end of file at offset {offset}");
+                        return;
+                    }
+
+                    totalRead += read;
+                }
+
+                string sourceHash = ConvertToHex(md5.ComputeHash(buffer));
+
+                bool valid = false;
+
+                for (int attempt = 1; attempt <= MaxRetries; attempt++)
+                {
+                    destination.Seek(offset, SeekOrigin.Begin);
+                    destination.Write(buffer, 0, bytesToRead);
+                    destination.Flush();
+
+                    destination.Seek(offset, SeekOrigin.Begin);
+                    byte[] verify = new byte[bytesToRead];
+                    destination.Read(verify, 0, bytesToRead);
+
+                    string destHash = ConvertToHex(md5.ComputeHash(verify));
+
+                    if (sourceHash == destHash)
+                    {
+                        blockChecksums[offset] = sourceHash;
+                        valid = true;
+                        break;
+                    }
+                }
+
+                if (!valid)
+                {
+                    errors.Add($"Block at offset {offset} failed verification.");
+                    return;
+                }
+            }
+        }
     }
     static string ComputeFileHash(string path)
     {
