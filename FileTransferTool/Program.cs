@@ -1,4 +1,5 @@
-﻿using System.Collections.Concurrent;
+﻿using FileTransferTool.Helpers;
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -89,46 +90,42 @@ class Program
         ConcurrentDictionary<long, string> blockChecksums,
         ConcurrentBag<string> errors)
         {
-            using FileStream source = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read);
-            using FileStream destination = new FileStream(destinationPath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+            using var source = new FileBlockStreamer(sourcePath, FileAccess.Read, BlockSize, FileShare.Read);
+            using var destination = new FileBlockStreamer(destinationPath, FileAccess.ReadWrite, BlockSize, FileShare.ReadWrite);
             using MD5 md5 = MD5.Create();
 
             while (blockQueue.TryDequeue(out long blockIndex))
             {
                 long offset = blockIndex * BlockSize;
-                int bytesToRead = (int)Math.Min(BlockSize, totalBytes - offset);
 
-                byte[] buffer = new byte[bytesToRead];
-
-                source.Seek(offset, SeekOrigin.Begin);
-                int totalRead = 0;
-
-                while (totalRead < bytesToRead)
+                byte[] data;
+                try
                 {
-                    int read = source.Read(buffer, totalRead, bytesToRead - totalRead);
-
-                    if (read == 0)
-                    {
-                        errors.Add($"Unexpected end of file at offset {offset}");
-                        return;
-                    }
-
-                    totalRead += read;
+                    data = source.ReadBlock(blockIndex, totalBytes);
+                }   
+                catch (Exception ex)
+                {
+                    errors.Add(ex.Message);
+                    return;
                 }
 
-                string sourceHash = ConvertToHex(md5.ComputeHash(buffer));
-
+                string sourceHash = ConvertToHex(md5.ComputeHash(data));
                 bool valid = false;
 
                 for (int attempt = 1; attempt <= MaxRetries; attempt++)
                 {
-                    destination.Seek(offset, SeekOrigin.Begin);
-                    destination.Write(buffer, 0, bytesToRead);
-                    destination.Flush();
+                    destination.WriteBlock(blockIndex, data);
 
-                    destination.Seek(offset, SeekOrigin.Begin);
-                    byte[] verify = new byte[bytesToRead];
-                    destination.Read(verify, 0, bytesToRead);
+                    byte[] verify;
+                    try
+                    {
+                        verify = destination.ReadBack(blockIndex, data.Length);
+                    }
+                    catch(Exception ex)
+                    {
+                        errors.Add(ex.Message);
+                        return;
+                    }
 
                     string destHash = ConvertToHex(md5.ComputeHash(verify));
 
